@@ -1,0 +1,381 @@
+---
+title: "Titanic"
+author: "Alex Wohletz"
+date: "October 28, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Titanic Dataset Machine Learning
+
+In this Kaggle.com competition, the stated evaluation criteria are to predict the passengers who survived or did not survived against the provided test set.  
+
+###First we load the packages we will be using to process the data:
+
+```{r message = FALSE}
+require(caret) #Model building
+require(AppliedPredictiveModeling) #Visualization
+require(ggplot2) #Visualization
+require(Amelia) #NA/Missing value visualization
+require(mice) #Missing value imputation
+require(e1071) #SVM
+require(party) #RPART
+require(dplyr) #Filtering and cleaning
+require(stringr) #String manipulation
+require(randomForest) #Random Forest machine learning
+library(doSNOW) #Enable more than one core
+
+
+```
+###Using a function borrowed from: [titanictutorial](https://github.com/wehrley/wehrley.github.io/blob/master/SOUPTONUTS.md) and modified to read the data from disc.
+
+```{r}
+readData <- function(path.name, file.name, column.types, missing.types) {
+  read.csv(paste(path.name, file.name, sep="") , 
+            colClasses=column.types,
+            na.strings=missing.types )
+}
+```
+
+
+
+###Assign the variables.
+
+To make our lives easier we will preprocess some of the import so it is in the correct form. 
+
+```{r }
+train.column.types <- c('integer',   # PassengerId
+                          'integer',    # Survived   
+                          'factor',    # Pclass
+                         'character', # Name
+                         'factor',    # Sex
+                         'numeric',   # Age
+                         'integer',   # SibSp
+                         'integer',   # Parch
+                         'character', # Ticket
+                         'numeric',   # Fare
+                         'character', # Cabin
+                         'factor')     # Embarked
+
+test.column.types <- train.column.types[-2] #Survived column does not exist in test
+train.data.file <- 'TitanicTrain.csv'
+test.data.file <- 'TitanicTest.csv'
+Titanic.path <- "C:/Users/Alex/OneDrive/MultivariateAnalysis/TitanicHW/"
+missing.types <- c("NA", "")
+```
+
+###Now we can go ahead and import the data into R
+
+```{r import data}
+
+train.data <-  readData(Titanic.path,train.data.file, train.column.types,missing.types)
+
+test.data <- readData(Titanic.path, test.data.file, 
+                     test.column.types, missing.types)
+
+```
+
+##Data Cleaning
+
+There are quite a few missing values in Age and more than 50% data loss in the Cabin variable!
+
+###For ease of cleaning, combine the test and the training data into a single dataframe
+
+```{r combine, results = 'asis'}
+test.data$Survived <- 0
+combined <- bind_rows(train.data,test.data)
+
+#Take a look at the data.
+knitr::kable(head(combined))
+
+knitr::kable(summary(combined))
+
+```
+
+
+###First let's take a look at the NA values using the Amelia function
+The Ameilia library provides some excellent tools for visualizing and imputing NA values.
+```{r missing}
+missmap(combined,col = c("orange","black"), main = "Titanic Training Data Missing Values",legend = F)
+
+```
+###Using the method outlined in the R Machine Learning Cookbook, let's impute some values
+
+```{r value imputation}
+#Impute missing values for Embarked using the most common factor
+combined$Embarked[which(is.na(combined$Embarked))] = 'S';
+
+#Do some regex for titles
+combined$Name = as.character(combined$Name)
+table_words = table(unlist(strsplit(combined$Name, "\\s+")))
+sort(table_words[grep('\\.', names(table_words))], decreasing = T)
+
+#Find the missing values in the titles
+tb = cbind(combined$Age, str_match(combined$Name,"[a-zA-Z]+\\."))
+table(tb[is.na(tb[,1]),2])
+
+#Impute missing values in age using an inference based on the titles
+
+#First we create the values to impute into the missing ages
+mean.mr = mean(combined$Age[grepl(" Mr\\.",combined$Name) & !is.na(combined$Age)])
+mean.mrs = mean(combined$Age[grepl(" Mrs\\.",combined$Name) & !is.na(combined$Age)])
+mean.dr = mean(combined$Age[grepl(" Dr\\.",combined$Name) & !is.na(combined$Age)])
+mean.miss = mean(combined$Age[grepl(" Miss\\.",combined$Name) & !is.na(combined$Age)])
+mean.master = mean(combined$Age[grepl(" Master\\.",combined$Name) & !is.na(combined$Age)])                               
+#Then we impute based on a conditional statement.
+combined$Age[grepl(" Mr\\.",combined$Name) & is.na(combined$Age)] = mean.mr
+combined$Age[grepl(" Mrs\\.",combined$Name) & is.na(combined$Age)] = mean.mrs
+combined$Age[grepl(" Dr\\.",combined$Name) & is.na(combined$Age)] = mean.dr
+combined$Age[grepl(" Miss\\.",combined$Name) & is.na(combined$Age)] = mean.miss
+combined$Age[grepl(" Master\\.",combined$Name) & is.na(combined$Age)] = mean.master
+combined$Age[grepl(" Ms\\.",combined$Name) & is.na(combined$Age)] = mean.miss
+
+#Remove the na Fares from the data using the median
+combined$Fare[which(is.na(combined$Fare))] <- median(combined$Fare, na.rm = T)
+```
+###Lets take a look at our efforts
+```{r review missing}
+
+#The survived column will contain NA values for the test set, so lets just leave it out.
+missmap(combined,col = c("orange","black"), main = "Titanic Training Data Missing Values",legend = F)
+```
+
+
+
+##Feature Engineering
+
+###Create Title, Family Size, and Average Fare features using the idea from the [tutorial](https://www.kaggle.com/mrisdal/titanic/exploring-survival-on-the-titanic) 
+Title is a great feature to add because the unfortunate souls with 'Mr' are much less likely to survive.
+Average fare turns out to have a fair amount of importance to model accuracy as well as family size.
+```{r feature engineering}
+#Use regex to extract title
+combined$Title <- gsub('(.*, )|(\\..*)', '', combined$Name)
+
+#And extract the last names
+library(gsubfn)
+combined$LastName <- strapplyc(combined$Name,"(.*)\\,", simplify = TRUE)
+#Take a look at the title counts
+table(combined$Title)
+#Survival of Reverends isn't good!
+combined$Survived[combined$Title %in% 'Rev']
+
+#Reduce the number of levels and also group some of the more rare titles to differentiate classes.
+combined$Title[combined$Title == 'Mlle'] <- 'Miss'
+combined$Title[combined$Title == 'Ms'] <- 'Miss'
+combined$Title[combined$Title == 'Mme'] <- 'Mrs'
+combined$Title[combined$Title %in% c("Jonkheer", "Don")] <- 'Sir'
+combined$Title[combined$Title %in% c("Dona",'the Countess')] <- 'Lady'
+combined$Title[combined$Title %in% c("Col",'Capt','Major')] <- 'Officer'
+
+#Lets also add a family size feature since larger families might have a harder time making it out
+combined$FamilySize <- combined$SibSp + combined$Parch + 1
+
+#It appears that as far as fares go, a single ticket might be priced for a group, so lets take the average fare for the number in the group and build it in as a feature.
+library(plyr)
+combined <- ddply(combined, .(Ticket), mutate, avg.fare = mean(Fare))
+
+#Now lets go ahead and factorize Title and Survived so they can be used later
+combined$FamilySize <- factor(combined$FamilySize)
+combined$Title <- factor(combined$Title)
+combined$Survived <- factor(combined$Survived)
+combined$SibSp <- factor(combined$SibSp)
+combined$Parch <- factor(combined$Parch)
+```
+
+###Split the data back into training and test sets.
+```{r test/train split}
+#Remember from above that combining the two sets introduced NA values into the Survived variable
+#We use that now to split our combined data into our training and test sets
+train.data <- filter(combined, PassengerId < 892)
+test.data <- filter(combined, PassengerId >= 892)
+
+
+```
+
+
+##Visualization: Exploratory data analysis
+###Now let's run some visualizations to deepen our understanding of the variables
+```{r exploratory data analysis}
+
+
+barplot(table(train.data$Survived), main = "Passengers Survived", names = c("Perished","Survived"), col ="black")
+barplot(table(train.data$Pclass), main = "Passenger Class", names = c("First","Second","Third"), col = 'darkblue')
+hist(train.data$Age, main = "Passenger Age", xlab = "Age", col = 'darkblue')
+plot(train.data[c("Pclass","Age")], col = c('blue','darkgreen','lightblue'))
+
+#Lets see who was more likely to survive, men or women
+counts = table(train.data$Survived,train.data$Sex)
+barplot(counts, col = c("red","black"), legend = c("Perished","Survived"), main = "Passenger Survival by Gender")
+
+mosaicplot(train.data$Pclass ~ train.data$Survived, main ='Passenger Survival By Class', shade = F,color = T, xlab = 'Passenger Class', ylab = 'Survived')
+```
+This visualization using support from the caret package is nice because it gives a colored breakdown of the selected predictors.
+```{r fancy, message = FALSE, warning=FALSE}
+#Fancy visualizations using caret and APM
+transparentTheme(trans = .4)
+featurePlot(x = combined[, 4:9], y = combined$Survived, plot = "pairs", auto.key = list(columns = 3))
+
+```
+
+As we can see from the visualizations, you were more likely to die if you were male and if you were in the third class.  First class women made out alright.  Lets look at the ages by survival.
+
+###Survival by Age
+
+```{r visualization continued}
+
+#Black is survived, red is dead.
+hist(train.data$Age[which(train.data$Survived == "0")], main = "Passenger Age by Survival", xlab = "Age",ylab = "Count", col = "red", breaks = seq(0,80, by = 2))
+hist(train.data$Age[which(train.data$Survived == "1")], add = T, col = "black", breaks = seq(0,80, by = 2))
+
+#Lets look at our average fare feature and see what it shows us
+hist(train.data$avg.fare[which(train.data$Survived == "0")],main = "Passenger Average Fare by Survival", xlab = "Average Fare",ylab = "Count", col = "red")
+
+hist(train.data$avg.fare[which(train.data$Survived == "1")], add = T, col = "black")
+
+
+
+```
+
+##Prediction using machine learning!
+For the models listed below, we use *trainControl* to set cross fold validation to increase the power of our models in predicting the test data.  Kappa is also used over Accuracy as a metric due to its ability to be a more robust measure of performance.  
+
+###My highest submission was from the C.5 model.
+
+###Random forest model
+Random forest is a great machine learning algorithm to apply against classification problems when no assumptions about linearity or normality are made.
+```{r randforest}
+#Setting the random seed allows for reproducibility
+set.seed(2348)
+#Spool up for some heavy work
+cl <-makeCluster(4, type = "SOCK")
+registerDoSNOW(cl)
+
+#Set up the stratification
+cv.10.folds <- createMultiFolds(train.data$Survived, k = 10, times =5)
+
+##Random Forest
+#Build a training control variable
+ctrl = trainControl(method="repeatedcv", number=10, repeats=5, index = cv.10.folds)
+
+#Based on variable importance
+rf_model <- train(Survived~FamilySize + Title + avg.fare + Sex, data = train.data, method = "rf", tuneLength = 2, trControl = ctrl, ntree = 1000)
+#Scores .78
+
+
+#Shutdown cluster
+stopCluster(cl)
+
+#Confusion Matrix and variable importance
+pred <- predict(rf_model,train.data)
+confusionMatrix(pred, train.data$Survived)
+plot(varImp(rf_model))
+
+#Prediction against test for submission
+pred <- predict(rf_model, test.data)
+
+```
+Notice the sensitivity and specificity are very high in the confusion matrix but the score on kaggle is very low, this model might be overfitting.
+
+###NNet model
+Another strong classifier using dimensionality reduction.
+```{r NNet}
+
+#Stratification
+cv.10.folds <- createMultiFolds(train.data$Survived, k = 5, times =10)
+
+#Spool up for some heavy work
+cl <-makeCluster(4, type = "SOCK")
+registerDoSNOW(cl)
+
+#Set up training control
+ctrl = trainControl(method="repeatedcv", number=10, repeats=10, index = cv.10.folds)
+
+nnet_model <- train(Survived~Pclass + Title + FamilySize + avg.fare + Sex, data = train.data, method = "nnet", trControl = ctrl, verbose = F, metric = 'Kappa')
+
+#Shutdown cluster
+stopCluster(cl)
+
+#Confusion matrix and variable importance
+pred <- predict(nnet_model, train.data)
+confusionMatrix(pred, train.data$Survived)
+plot(varImp(nnet_model))
+
+#Prediction against test for submission
+pred <- predict(nnet_model, test.data)
+
+```
+Interesting, neural net has completely different variable importance, assigning almost nothing to the Sex variable.
+
+###Adaboost
+This model is an elegant method for auto-tuning a classifier.
+```{r Adaboost}
+set.seed(1748)
+#Stratification
+cv.10.folds <- createMultiFolds(train.data$Survived, k = 5, times =5)
+
+#Spool up for some heavy work
+cl <-makeCluster(4, type = "SOCK")
+registerDoSNOW(cl)
+
+#Set up training control
+ctrl = trainControl(method="repeatedcv", number=10, repeats=10, index = cv.10.folds)
+
+ada_model <- train(Survived~Pclass + Title + FamilySize + avg.fare + Age + Sex, data = train.data, method = 'adaboost', trControl = ctrl, metric = "Kappa")
+
+#Shutdown cluster
+stopCluster(cl)
+
+#Confusion matrix and variable importance
+pred <- predict(ada_model, train.data)
+confusionMatrix(pred, train.data$Survived)
+plot(varImp(ada_model), main = 'AdaModel')
+ggplot(ada_model)
+
+#Prediction against test for submission
+pred <- predict(ada_model, test.data)
+
+```
+##Bonus model
+###C5
+C5 Model is a very strong classifier and no series of models would be complete without it.  It is also the best scoring of the models used.
+```{r c5_model}
+#Stratification
+cv.10.folds <- createMultiFolds(train.data$Survived, k = 5, times =10)
+
+#Spool up for some heavy work
+cl <-makeCluster(4, type = "SOCK")
+registerDoSNOW(cl)
+
+#Set up training control
+ctrl = trainControl(method="repeatedcv", number=10, repeats=10, index = cv.10.folds)
+
+c5_model <- train(Survived~Pclass + Title + FamilySize + avg.fare, data = train.data, method = 'C5.0',trControl = ctrl, metric = 'Kappa', tuneLength = 3)
+##Scores .79904 with Pclass + Title + FamilySize + avg.fare (+- Embarked)
+
+#Shutdown cluster
+stopCluster(cl)
+
+#Confusion matrix and variable importance
+pred <- predict(c5_model, train.data)
+confusionMatrix(pred, train.data$Survived)
+plot(varImp(c5_model))
+
+#Prediction against test for submission
+pred <- predict(c5_model, test.data)
+
+```
+
+##Submission
+We write the submission results to a csv
+```{r submission}
+solution <- data.frame(PassengerID = test.data$PassengerId, Survived = pred)
+write.csv(solution, file = "solution_awohl.csv", row.names = F)
+```
+
+
+
+
+
